@@ -1,0 +1,27 @@
+mode: workshop
+topic: "API Design Guide for REST Services"
+brief: |
+  Write a comprehensive guide for designing REST APIs.
+  Cover: naming conventions, versioning, error formats, auth, pagination.
+  Audience: backend engineers. Length: 1500-2500 words.
+
+participants:
+  author:
+    name: "Technical Writer"
+    role: |
+      Experienced technical writer specializing in API documentation
+      and developer guides. You write clear, practical prose with
+      concrete examples. You favor opinionated guidance over wishy-washy
+      "it depends" advice.
+  editor:
+    name: "Senior Architect"
+    role: |
+      Senior software architect with 15+ years building production APIs.
+      You review for technical accuracy, completeness against the brief,
+      and practical usefulness. You push for specificity and real-world
+      applicability.
+
+max_turns: 20
+check_in_interval: 6
+turn_timeout: 300
+output_dir: "./workshops"
