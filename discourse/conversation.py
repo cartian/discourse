@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import os
 import re
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +33,7 @@ class Config:
     check_in_interval: int = 4
     turn_timeout: int = 300
     output_dir: str = "./conversations"
+    source_path: Path | None = None
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> Config:
@@ -70,18 +71,24 @@ class Config:
             check_in_interval=data.get("check_in_interval", 4),
             turn_timeout=data.get("turn_timeout", 300),
             output_dir=data.get("output_dir", "./conversations"),
+            source_path=Path(path).resolve(),
         )
 
 
 class Conversation:
     def __init__(self, config: Config, output_dir: str | None = None):
         self.config = config
-        self.output_dir = Path(output_dir or config.output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        base_dir = Path(output_dir or config.output_dir)
+        base_dir.mkdir(parents=True, exist_ok=True)
 
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         slug = re.sub(r"[^a-z0-9]+", "-", config.topic.lower()).strip("-")[:60]
-        self.file_path = self.output_dir / f"{timestamp}-{slug}.md"
+        self.session_dir = base_dir / f"{timestamp}-{slug}"
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        self.file_path = self.session_dir / "conversation.md"
+
+        if config.source_path and config.source_path.is_file():
+            shutil.copy2(config.source_path, self.session_dir / "config.yaml")
 
         self.started_at = datetime.now(timezone.utc).isoformat()
         self.total_turns = 0

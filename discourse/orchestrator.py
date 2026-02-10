@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
 import click
 
+from .audit import AuditLog
 from .claude import InvokeResult, invoke_claude, handle_error, check_referee_request
 from .conversation import Config, Conversation
 
@@ -41,6 +43,7 @@ class Orchestrator:
     def __init__(self, config: Config, output_dir: str | None = None):
         self.config = config
         self.conversation = Conversation(config, output_dir=output_dir)
+        self.audit = AuditLog(self.conversation.session_dir)
         self.sessions: dict[str, str | None] = {"a": None, "b": None}
 
     def run(self) -> Path:
@@ -54,20 +57,40 @@ class Orchestrator:
         click.echo(f"Conversation file: {file_path}")
         click.echo()
 
+        self.audit.log_session_start(
+            mode="debate",
+            topic=self.config.topic,
+            participants={
+                k: {"name": v.name, "role": v.role}
+                for k, v in self.config.participants.items()
+            },
+            config={
+                "max_turns": self.config.max_turns,
+                "check_in_interval": self.config.check_in_interval,
+                "turn_timeout": self.config.turn_timeout,
+            },
+        )
+
+        status = "completed"
         try:
             self._run_turns()
             closing = self._collect_closing_statements()
             self.conversation.finalize("completed", closing)
         except KeyboardInterrupt:
+            status = "interrupted"
             click.echo("\n\nInterrupted! Finalizing conversation...")
             self.conversation.finalize("interrupted")
         except SystemExit:
+            status = "aborted"
             click.echo("\nAborted! Finalizing conversation...")
             self.conversation.finalize("aborted")
+        finally:
+            self.audit.log_session_end(status, self.conversation.total_turns)
+            self.audit.close()
 
-        click.echo(f"\nConversation saved to: {self.conversation.file_path}")
+        click.echo(f"\nConversation saved to: {self.conversation.session_dir}")
         click.echo(f"Total turns: {self.conversation.total_turns}")
-        return self.conversation.file_path
+        return self.conversation.session_dir
 
     def _run_turns(self) -> None:
         for turn in range(1, self.config.max_turns + 1):
@@ -87,6 +110,7 @@ class Orchestrator:
                 click.echo(f"  {referee_question}")
                 answer = click.prompt("Referee response")
                 self.conversation.append_referee_note(turn, answer)
+                self.audit.log_referee(turn, referee_question, answer)
                 response_text = cleaned_text
 
             self.conversation.append_turn(turn, participant.name, response_text)
@@ -112,7 +136,11 @@ class Orchestrator:
             role_description=participant.role,
         )
 
+        self.audit.log_turn_start(turn, speaker_key, participant.name)
+
         while True:
+            is_new_session = self.sessions[speaker_key] is None
+
             try:
                 # Use system prompt on first turn, resume on subsequent
                 if self.sessions[speaker_key] is None:
@@ -121,17 +149,30 @@ class Orchestrator:
                         system_prompt=system_prompt,
                         timeout=self.config.turn_timeout,
                     )
+                    effective_system_prompt = system_prompt
                 else:
                     result = invoke_claude(
                         prompt=prompt,
                         session_id=self.sessions[speaker_key],
                         timeout=self.config.turn_timeout,
                     )
+                    effective_system_prompt = None
+
                 self.sessions[speaker_key] = result.session_id
+                self._save_sessions()
+                self.audit.log_invoke(
+                    turn=turn,
+                    participant_key=speaker_key,
+                    result=result,
+                    prompt=prompt,
+                    system_prompt=effective_system_prompt,
+                    is_new_session=is_new_session,
+                )
                 return result.text
 
             except (subprocess.TimeoutExpired, RuntimeError) as e:
                 action = handle_error(turn, participant.name, e)
+                self.audit.log_error(turn, speaker_key, participant.name, e, action)
                 if action == "retry":
                     continue
                 elif action == "skip":
@@ -139,6 +180,12 @@ class Orchestrator:
                         turn, participant.name, "*(Turn skipped due to error.)*"
                     )
                     return None
+
+    def _save_sessions(self) -> None:
+        """Write current session IDs to sessions.json."""
+        path = self.conversation.session_dir / "sessions.json"
+        data = {k: v for k, v in self.sessions.items() if v is not None}
+        path.write_text(json.dumps(data, indent=2) + "\n")
 
     def _check_in(self, turn: int) -> bool:
         """Pause for referee check-in. Returns True to continue, False to stop."""
@@ -152,12 +199,15 @@ class Orchestrator:
         )
 
         if choice == "c":
+            self.audit.log_check_in(turn, "continue")
             return True
         elif choice == "s":
+            self.audit.log_check_in(turn, "stop")
             return False
         elif choice == "m":
             message = click.prompt("Referee message")
             self.conversation.append_referee_note(turn, message)
+            self.audit.log_check_in(turn, "message", message)
             click.echo("  Message added to conversation.")
             return True
 
@@ -177,6 +227,9 @@ class Orchestrator:
                 conversation_content=conversation_content,
             )
 
+            closing_turn = self.conversation.total_turns + 1
+            is_new_session = self.sessions[key] is None
+
             try:
                 if self.sessions[key] is not None:
                     result = invoke_claude(
@@ -184,6 +237,7 @@ class Orchestrator:
                         session_id=self.sessions[key],
                         timeout=self.config.turn_timeout,
                     )
+                    effective_sp = None
                 else:
                     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
                         participant_name=participant.name,
@@ -194,9 +248,20 @@ class Orchestrator:
                         system_prompt=system_prompt,
                         timeout=self.config.turn_timeout,
                     )
+                    effective_sp = system_prompt
+
+                self.audit.log_invoke(
+                    turn=closing_turn,
+                    participant_key=key,
+                    result=result,
+                    prompt=prompt,
+                    system_prompt=effective_sp,
+                    is_new_session=is_new_session,
+                )
                 statements[key] = result.text
                 click.echo(f"  {participant.name} — done")
             except (subprocess.TimeoutExpired, RuntimeError) as e:
+                self.audit.log_error(closing_turn, key, participant.name, e, "skip")
                 click.echo(f"  Warning: Could not get closing statement from {participant.name}: {e}")
                 statements[key] = "*(Closing statement could not be collected due to an error.)*"
 

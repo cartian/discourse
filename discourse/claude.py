@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import click
@@ -14,7 +15,18 @@ import click
 class InvokeResult:
     text: str
     session_id: str
-    raw: dict
+    raw: list = field(default_factory=list)
+    model: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_creation_tokens: int | None = None
+    duration_ms: int | None = None
+    duration_api_ms: int | None = None
+    cost_usd: float | None = None
+    num_turns: int | None = None
+    is_error: bool = False
+    wall_clock_ms: float | None = None
 
 
 def invoke_claude(
@@ -38,12 +50,14 @@ def invoke_claude(
     cmd.extend(["--permission-mode", "bypassPermissions"])
     cmd.append(prompt)
 
+    t0 = time.perf_counter()
     result = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
         timeout=timeout,
     )
+    wall_clock_ms = (time.perf_counter() - t0) * 1000
 
     if result.returncode != 0:
         raise RuntimeError(
@@ -90,7 +104,68 @@ def invoke_claude(
                 if text:
                     break
 
-    return InvokeResult(text=text, session_id=actual_session_id, raw=events)
+    # Extract metadata from CLI JSON events
+    model = None
+    input_tokens = None
+    output_tokens = None
+    cache_read_tokens = None
+    cache_creation_tokens = None
+    duration_ms = None
+    duration_api_ms = None
+    cost_usd = None
+    num_turns = None
+    is_error = False
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        etype = event.get("type")
+
+        if etype == "system":
+            if not model:
+                model = event.get("model")
+
+        elif etype == "assistant":
+            msg = event.get("message", {})
+            if not model:
+                model = msg.get("model")
+            usage = msg.get("usage", {})
+            if usage:
+                input_tokens = usage.get("input_tokens", input_tokens)
+                output_tokens = usage.get("output_tokens", output_tokens)
+                cache_read_tokens = usage.get("cache_read_input_tokens", cache_read_tokens)
+                cache_creation_tokens = usage.get("cache_creation_input_tokens", cache_creation_tokens)
+
+        elif etype == "result":
+            duration_ms = event.get("duration_ms", duration_ms)
+            duration_api_ms = event.get("duration_api_ms", duration_api_ms)
+            cost_usd = event.get("total_cost_usd", cost_usd)
+            num_turns = event.get("num_turns", num_turns)
+            is_error = event.get("is_error", False)
+            # result event may also carry usage
+            usage = event.get("usage", {})
+            if usage:
+                input_tokens = usage.get("input_tokens", input_tokens)
+                output_tokens = usage.get("output_tokens", output_tokens)
+                cache_read_tokens = usage.get("cache_read_input_tokens", cache_read_tokens)
+                cache_creation_tokens = usage.get("cache_creation_input_tokens", cache_creation_tokens)
+
+    return InvokeResult(
+        text=text,
+        session_id=actual_session_id,
+        raw=events,
+        model=model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_creation_tokens=cache_creation_tokens,
+        duration_ms=duration_ms,
+        duration_api_ms=duration_api_ms,
+        cost_usd=cost_usd,
+        num_turns=num_turns,
+        is_error=is_error,
+        wall_clock_ms=wall_clock_ms,
+    )
 
 
 def handle_error(turn_number: int, participant_name: str, error: Exception) -> str | None:

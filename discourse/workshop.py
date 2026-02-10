@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 import re
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
 import click
 
+from .audit import AuditLog
 from .claude import invoke_claude, handle_error, check_referee_request
 from .conversation import Config
 from .document import Document, EditorialLog
@@ -100,8 +103,12 @@ class WorkshopOrchestrator:
         self.session_dir = base_dir / f"{timestamp}-{slug}"
         self.session_dir.mkdir(parents=True, exist_ok=True)
 
+        if config.source_path and config.source_path.is_file():
+            shutil.copy2(config.source_path, self.session_dir / "config.yaml")
+
         self.document = Document(self.session_dir, config.topic, config.source_file)
         self.log = EditorialLog(self.session_dir, config.topic, config.brief)
+        self.audit = AuditLog(self.session_dir)
         self.sessions: dict[str, str | None] = {"author": None, "editor": None}
         self.total_turns = 0
 
@@ -116,15 +123,35 @@ class WorkshopOrchestrator:
         click.echo(f"  Session: {self.session_dir}")
         click.echo()
 
+        self.audit.log_session_start(
+            mode="workshop",
+            topic=self.config.topic,
+            participants={
+                k: {"name": v.name, "role": v.role}
+                for k, v in self.config.participants.items()
+            },
+            config={
+                "max_turns": self.config.max_turns,
+                "check_in_interval": self.config.check_in_interval,
+                "turn_timeout": self.config.turn_timeout,
+            },
+        )
+
+        status = "completed"
         try:
             self._run_workshop_loop()
             self.log.finalize("completed", self.total_turns)
         except KeyboardInterrupt:
+            status = "interrupted"
             click.echo("\n\nInterrupted! Finalizing...")
             self.log.finalize("interrupted", self.total_turns)
         except SystemExit:
+            status = "aborted"
             click.echo("\nAborted! Finalizing...")
             self.log.finalize("aborted", self.total_turns)
+        finally:
+            self.audit.log_session_end(status, self.total_turns)
+            self.audit.close()
 
         click.echo(f"\nDocument: {self.document.file_path}")
         click.echo(f"Editorial log: {self.log.file_path}")
@@ -232,8 +259,12 @@ class WorkshopOrchestrator:
 
     def _invoke_with_retry(self, turn: int, role_key: str, prompt: str, system_prompt: str | None = None) -> str | None:
         participant = self.config.participants[role_key]
+        self.audit.log_turn_start(turn, role_key, participant.name)
 
         while True:
+            is_new_session = self.sessions[role_key] is None
+            effective_system_prompt = system_prompt
+
             try:
                 if self.sessions[role_key] is None and system_prompt:
                     result = invoke_claude(
@@ -247,6 +278,7 @@ class WorkshopOrchestrator:
                         session_id=self.sessions[role_key],
                         timeout=self.config.turn_timeout,
                     )
+                    effective_system_prompt = None
                 else:
                     # First call but no system prompt provided — create system prompt
                     sp = AUTHOR_SYSTEM_PROMPT if role_key == "author" else EDITOR_SYSTEM_PROMPT
@@ -254,6 +286,7 @@ class WorkshopOrchestrator:
                         participant_name=participant.name,
                         role_description=participant.role,
                     )
+                    effective_system_prompt = sp
                     result = invoke_claude(
                         prompt=prompt,
                         system_prompt=sp,
@@ -261,10 +294,20 @@ class WorkshopOrchestrator:
                     )
 
                 self.sessions[role_key] = result.session_id
+                self._save_sessions()
+                self.audit.log_invoke(
+                    turn=turn,
+                    participant_key=role_key,
+                    result=result,
+                    prompt=prompt,
+                    system_prompt=effective_system_prompt,
+                    is_new_session=is_new_session,
+                )
                 return result.text
 
             except (subprocess.TimeoutExpired, RuntimeError) as e:
                 action = handle_error(turn, participant.name, e)
+                self.audit.log_error(turn, role_key, participant.name, e, action)
                 if action == "retry":
                     continue
                 elif action == "skip":
@@ -278,8 +321,15 @@ class WorkshopOrchestrator:
             click.echo(f"    {question}")
             answer = click.prompt("  Referee response")
             self.log.append_referee_note(self.total_turns, answer)
+            self.audit.log_referee(self.total_turns, question, answer)
             return cleaned
         return text
+
+    def _save_sessions(self) -> None:
+        """Write current session IDs to sessions.json."""
+        path = self.session_dir / "sessions.json"
+        data = {k: v for k, v in self.sessions.items() if v is not None}
+        path.write_text(json.dumps(data, indent=2) + "\n")
 
     def _is_approved(self, feedback: str) -> bool:
         return bool(re.search(r"\bVerdict:\s*APPROVED\b", feedback, re.IGNORECASE))
@@ -295,8 +345,10 @@ class WorkshopOrchestrator:
         )
 
         if choice == "c":
+            self.audit.log_check_in(turn, "continue")
             return "continue"
         elif choice == "s":
+            self.audit.log_check_in(turn, "stop")
             return "stop"
         elif choice == "v":
             click.echo(f"\n--- Document ---\n")
@@ -307,6 +359,7 @@ class WorkshopOrchestrator:
         elif choice == "m":
             message = click.prompt("Referee message")
             self.log.append_referee_note(turn, message)
+            self.audit.log_check_in(turn, "message", message)
             click.echo("  Message added to editorial log.")
             return "continue"
 
